@@ -1,0 +1,4 @@
+telemetry-parser
+rosbags
+opencv-python
+numpy

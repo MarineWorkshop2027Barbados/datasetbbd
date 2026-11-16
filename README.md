@@ -27,7 +27,7 @@ It includes tutorials to:
 ### Setup
 
 ```bash
-git clone https://github.com/<your-account>/datasetbbd.git
+git clone https://github.com/MarineWorkshop2027Barbados/datasetbbd.git
 cd datasetbbd
 
 # virtual environment (recommended)

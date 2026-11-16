@@ -229,6 +229,32 @@ The line `IMU : source = …` in the output tells you which source was used.
 - **Heading**: it's not clear whether the camera uses its magnetometer in the fusion, so the yaw is probably relative and drifts.
 - **Raw units**: the time unit of the raw series (ms or s) and the gyroscope unit are guessed automatically. Check them on your first clip and force them with `--time-unit` and `--gyro-unit` if needed.
 
+## 4. View a bag: `view_rosbag.py`
+
+The script plays the bag back. It shows the images of `/action5/image` with the attitude from `/action5/imu` overlaid: roll, pitch, yaw, an artificial horizon, gyroscope and accelerometer values. It reads ROS 1 and ROS 2 bags, and doesn't need ROS either.
+
+### Usage
+
+```bash
+python view_rosbag.py bags/DJI_xxxx                # ROS 2 bag (folder)
+python view_rosbag.py bags/DJI_xxxx.bag            # ROS 1 bag
+python view_rosbag.py bags/DJI_xxxx --plot         # + attitude / gyro / accel plots (matplotlib)
+python view_rosbag.py bags/DJI_xxxx --save annotated.mp4 --no-show   # annotated video, no window
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--width` | `1280` | display width (px) |
+| `--speed` | `1.0` | playback speed |
+| `--start` | `0` | start time (s from the beginning of the bag) |
+| `--plot` | off | plot the attitude, gyroscope and accelerometer over time |
+| `--save` | none | write the annotated video to a file |
+| `--no-show` | off | no window (use with `--save`, e.g. on a server) |
+
+Keys: `space` pause, `n` next frame (when paused), `+` / `-` speed, `h` horizon on/off, `q` or `Esc` quit.
+
+---
+
 ## Acknowledgements
 
 The decoding of the DJI metadata relies on [telemetry-parser](https://github.com/AdrianEddy/telemetry-parser) by AdrianEddy (Gyroflow project).

@@ -1,13 +1,17 @@
 # datasetbbd
 
-This project includes scripts for data gathering during the McGill Barbados workshop 2027.
-It includes tutorials to:
+This project includes scripts for data gathering during the McGill Barbados workshop 2027: a DJI Osmo Action 5 Pro mounted on a Deep Trekker ROV, with the camera data and the ROV log merged into a single synchronized ROS bag.
 
-1. configure a DJI Osmo Action 5 Pro so that it records its inertial data (IMU and attitude),
-2. extract the IMU data and the camera attitude from the MP4 files to CSV,
-3. convert a video and its inertial, pressure and temperature data into a ROS bag (ROS 1 or ROS 2),
-4. play a bag back with the attitude overlaid on the images,
-5. inspect the raw DJI metadata track.
+The pipeline:
+
+1. **Configure the camera** so that it records its inertial data.
+2. **Extract the camera data**: CSV (`dji_imu_extract.py`) and ROS bag (`mp4_to_rosbag.py`).
+3. **Analyse the Deep Trekker log** (`rov_analysis.py`).
+4. **Synchronize** the camera and the ROV (`sync_rov_camera.py`).
+5. **Merge** everything into one bag on the ROV clock (`merge_bag.py`).
+6. **Check** the result (`view_rosbag.py`), and inspect the raw camera metadata if needed (`djmd_inspect.py`).
+
+The ROV log is the CSV written by the lab's `log_rov_csv.py` (one row per polling of the ROV state, with a `t_unix` column).
 
 ## Installation
 
@@ -22,10 +26,10 @@ It includes tutorials to:
 | Library | Used by | Purpose |
 |---|---|---|
 | `telemetry-parser` | `dji_imu_extract.py`, `mp4_to_rosbag.py` | decodes the DJI `djmd` metadata track (Gyroflow) |
-| `rosbags` | `mp4_to_rosbag.py`, `view_rosbag.py` | writes and reads ROS 1 and ROS 2 bags without ROS |
+| `rosbags` | `mp4_to_rosbag.py`, `sync_rov_camera.py`, `merge_bag.py`, `view_rosbag.py` | writes and reads ROS 1 and ROS 2 bags without ROS |
 | `opencv-python` | `mp4_to_rosbag.py`, `view_rosbag.py` | video decoding, JPEG encoding and display |
-| `numpy` | `mp4_to_rosbag.py`, `view_rosbag.py` | image buffers, interpolation and covariance arrays |
-| `matplotlib` | `view_rosbag.py` (`--plot` only) | attitude and IMU plots |
+| `numpy` | all scripts but `djmd_inspect.py` | signal processing |
+| `matplotlib` | `rov_analysis.py`, `sync_rov_camera.py`, `view_rosbag.py --plot` | figures |
 
 `djmd_inspect.py` only uses the Python standard library.
 
@@ -55,47 +59,21 @@ Check the installation:
 python -c "import telemetry_parser, rosbags, cv2, numpy, matplotlib; print('OK')"
 ```
 
-Keep all the scripts in the same folder: `mp4_to_rosbag.py` imports functions from `dji_imu_extract.py` and `djmd_inspect.py`.
+Keep all the scripts in the same folder: they import functions from each other.
 
-## Usage overview
+## Quick start
 
-1. **Before the session**: configure the camera (section 1) and check a test clip.
-2. **After the dive**: copy the `.MP4` files from the SD card (`DCIM/DJI_001/`) to your computer. The `.LRF` files are low-resolution proxies and are not needed.
-3. **Extract to CSV** (section 2):
-   ```bash
-   python dji_imu_extract.py DJI_xxxx.MP4 -o output/
-   ```
-4. **Convert to a ROS bag** (section 3):
-   ```bash
-   python mp4_to_rosbag.py DJI_xxxx.MP4 -o bags/DJI_xxxx --temp-field 3/2/13:2           # ROS 2
-   python mp4_to_rosbag.py DJI_xxxx.MP4 -o bags/DJI_xxxx.bag --ros 1 --temp-field 3/2/13:2   # ROS 1
-   ```
-5. **Check the bag**:
-   ```bash
-   ros2 bag info bags/DJI_xxxx       # ROS 2 (if ROS 2 is installed)
-   rosbag info bags/DJI_xxxx.bag     # ROS 1 (if ROS 1 is installed)
-   python view_rosbag.py bags/DJI_xxxx   # images + attitude (section 4)
-   ```
-
-To process a whole folder of clips:
+For one dive, with the camera clip `DJI_xxxx.MP4` and the ROV log `rov_xxxx.csv`:
 
 ```bash
-mkdir -p output bags
-for f in clips/*.MP4; do
-  name=$(basename "$f" .MP4)
-  python dji_imu_extract.py "$f" -o output/
-  python mp4_to_rosbag.py "$f" -o "bags/$name" --overwrite --temp-field 3/2/13:2
-done
+python mp4_to_rosbag.py DJI_xxxx.MP4 -o bags/DJI_xxxx --temp-field 3/2/13:2      # camera bag
+python rov_analysis.py rov_xxxx.csv -o reports/rov_xxxx                            # ROV report
+python sync_rov_camera.py rov_xxxx.csv bags/DJI_xxxx -o sync/DJI_xxxx             # clock offset
+python merge_bag.py bags/DJI_xxxx rov_xxxx.csv --sync sync/DJI_xxxx/sync.json -o merged/DJI_xxxx   # merged bag
+python view_rosbag.py merged/DJI_xxxx                                              # check
 ```
 
-Every script lists its options with `--help`:
-
-```bash
-python dji_imu_extract.py --help
-python mp4_to_rosbag.py --help
-python view_rosbag.py --help
-python djmd_inspect.py --help
-```
+Every script lists its options with `--help`.
 
 ---
 
@@ -116,13 +94,17 @@ The camera doesn't write its inertial data to a separate file. It stores them **
 
 ### Recommended settings
 
-- **Camera clock**: connect the camera to DJI Mimo before the session so that its clock syncs with the phone. The ROS bag timestamps start from the creation time stored in the MP4. If you need accurate absolute time (e.g. syncing with other sensors), note the offset or use `--t0` (see section 3).
 - **Constant frame rate**: choose a fixed resolution and frame rate (e.g. 2.7K 4:3, 30 fps) and keep it for the whole dataset.
-- **Write down the settings** for each clip (resolution, fps, depth or site) in a field log.
+- **Camera clock**: connect the camera to DJI Mimo before the session so that its clock syncs with the phone. The camera clock is corrected anyway by the synchronization (section 4), but a close starting point makes the result easier to check.
+- **Field log**: write down the settings, site and dive of each clip.
+
+### Synchronization manoeuvre
+
+The camera and the ROV are synchronized by matching the rotations they both see (section 4). **At the start of each dive, with both recording, give the ROV a few sharp yaw turns** (and tilts if possible). A ROV holding heading and depth produces too little motion for a reliable synchronization.
 
 ### What the Action 5 Pro records
 
-Identified with `djmd_inspect.py` (section 5) and the [ExifTool DJI tag tables](https://exiftool.sourceforge.net/TagNames/DJI.html) (`dvtm_ac204.proto`):
+Identified with `djmd_inspect.py` (section 6) and the [ExifTool DJI tag tables](https://exiftool.sourceforge.net/TagNames/DJI.html) (`dvtm_ac204.proto`):
 
 | `djmd` field | Content | Rate |
 |---|---|---|
@@ -136,9 +118,9 @@ Identified with `djmd_inspect.py` (section 5) and the [ExifTool DJI tag tables](
 | `3/2/3:1` | ISO | one per frame |
 | `3/1:1`, `3/1:2` | frame number, frame timestamp (µs) | one per frame |
 
-**There is no raw gyroscope and no high-rate accelerometer** in the file: the gyroscope is derived from the 1 kHz attitude (section 3).
+**There is no raw gyroscope and no high-rate accelerometer** in the file: the gyroscope is derived from the 1 kHz attitude (section 2).
 
-**In a waterproof housing**, the barometer measures the air sealed inside the housing, not the water pressure: it can't be used as a depth sensor. Use a dive computer for depth.
+**In a waterproof housing**, the barometer measures the air sealed inside the housing, not the water pressure. The depth comes from the ROV (section 5).
 
 ### Check before going in the field
 
@@ -150,71 +132,47 @@ ffprobe -hide_banner DJI_xxxx.MP4 2>&1 | grep -i "data"
 
 You should see a data stream tagged `djmd` (and usually a `dbgi` one). If there is no such stream, check the stabilization and FOV settings and record again.
 
-You can also run the extraction script (section 2) on the test clip: it should write a non-empty `_attitude.csv` file.
-
 ---
 
-## 2. Extract IMU and attitude to CSV: `dji_imu_extract.py`
+## 2. Extract the camera data
 
-The script uses [telemetry-parser](https://github.com/AdrianEddy/telemetry-parser), the library behind [Gyroflow](https://gyroflow.xyz), to decode the `djmd` track.
+### To CSV: `dji_imu_extract.py`
 
-### Usage
+Uses [telemetry-parser](https://github.com/AdrianEddy/telemetry-parser), the library behind [Gyroflow](https://gyroflow.xyz).
 
 ```bash
 python dji_imu_extract.py DJI_xxxx.MP4 -o output/ [--dump-json]
 ```
 
-### Outputs
-
 | File | Content |
 |---|---|
-| `<name>_gyro_raw.csv` | `t, gx, gy, gz`: raw gyroscope data, as decoded |
-| `<name>_accl_raw.csv` | `t, ax, ay, az`: raw accelerometer data, as decoded |
-| `<name>_imu_norm.csv` | `timestamp_ms, gx_dps, gy_dps, gz_dps, ax, ay, az, mx, my, mz`: IMU in the Gyroflow camera frame, gyro in deg/s |
 | `<name>_attitude.csv` | `t, qw, qx, qy, qz, roll_deg, pitch_deg, yaw_deg`: camera attitude (Hamilton quaternion) and ZYX Euler angles |
-| `<name>_telemetry.json` | (with `--dump-json`) all the decoded telemetry, for inspection |
+| `<name>_gyro_raw.csv`, `<name>_accl_raw.csv`, `<name>_imu_norm.csv` | raw / normalized IMU, when telemetry-parser provides it (not on the Action 5 Pro) |
+| `<name>_telemetry.json` | (with `--dump-json`) all the decoded telemetry |
 
-A file is only written if the matching data exists in the clip. **On the Action 5 Pro, telemetry-parser only returns the attitude**, so only `_attitude.csv` is written. The per-frame accelerometer, pressure and temperature can be exported with `djmd_inspect.py --export` (section 5), and are included in the ROS bag (section 3).
+On the Action 5 Pro only `_attitude.csv` is written. The per-frame accelerometer, pressure and temperature can be exported with `djmd_inspect.py --export` (section 6), and are included in the bag.
 
----
+### To a ROS bag: `mp4_to_rosbag.py`
 
-## 3. Convert to a ROS bag: `mp4_to_rosbag.py`
-
-The script writes the video frames, the IMU and, optionally, pressure and temperature into a bag. It uses [rosbags](https://gitlab.com/ternaris/rosbags), a pure Python library, so **no ROS installation is needed**. The same script writes ROS 1 (`.bag`) or ROS 2 (sqlite3 or mcap) bags.
-
-### Usage
+Uses [rosbags](https://gitlab.com/ternaris/rosbags), a pure Python library: **no ROS installation is needed**. Writes ROS 1 (`.bag`) or ROS 2 (sqlite3 or mcap) bags.
 
 ```bash
-# ROS 2 (sqlite3)
-python mp4_to_rosbag.py DJI_xxxx.MP4 -o bag_ros2
-
-# ROS 2 (mcap)
-python mp4_to_rosbag.py DJI_xxxx.MP4 -o bag_ros2 --storage mcap
-
-# ROS 1
-python mp4_to_rosbag.py DJI_xxxx.MP4 -o clip.bag --ros 1
-
-# Raw images at half resolution, one frame out of two
-python mp4_to_rosbag.py DJI_xxxx.MP4 -o bag --raw --scale 0.5 --every 2
-
-# With the barometer (pressure / depth) and the temperature
-python mp4_to_rosbag.py DJI_xxxx.MP4 -o bag --overwrite \
-    --depth-field 3/2/13:3 --depth-unit hpa --p-atm auto --temp-field 3/2/13:2
+python mp4_to_rosbag.py DJI_xxxx.MP4 -o bags/DJI_xxxx                        # ROS 2 (sqlite3)
+python mp4_to_rosbag.py DJI_xxxx.MP4 -o bags/DJI_xxxx --storage mcap         # ROS 2 (mcap)
+python mp4_to_rosbag.py DJI_xxxx.MP4 -o bags/DJI_xxxx.bag --ros 1            # ROS 1
+python mp4_to_rosbag.py DJI_xxxx.MP4 -o bags/DJI_xxxx --scale 0.5 --every 2  # lighter images
+python mp4_to_rosbag.py DJI_xxxx.MP4 -o bags/DJI_xxxx --temp-field 3/2/13:2 \
+    --depth-field 3/2/13:3 --depth-unit hpa --p-atm auto                     # + camera barometer
 ```
-
-### Topics
 
 | Topic | Type | frame_id | Content |
 |---|---|---|---|
-| `/action5/imu` | `sensor_msgs/Imu` | `action5_imu` | angular velocity (rad/s), linear acceleration (m/s²), orientation (camera quaternion, SLERP-interpolated at each IMU sample) |
-| `/action5/image` | `sensor_msgs/CompressedImage` (JPEG, default) or `sensor_msgs/Image` (`bgr8`, with `--raw`) | `action5_camera` | video frames |
-| `/action5/pressure` | `sensor_msgs/FluidPressure` | `action5_depth` | pressure (Pa), with `--depth-field` |
-| `/action5/depth` | `geometry_msgs/PointStamped` | `action5_depth` | `point.z` = depth (m, positive down), with `--depth-field` |
+| `/action5/imu` | `sensor_msgs/Imu` | `action5_imu` | angular velocity (rad/s), linear acceleration (m/s²), orientation (camera quaternion) |
+| `/action5/image` | `sensor_msgs/CompressedImage` (JPEG) or `sensor_msgs/Image` (`bgr8`, `--raw`) | `action5_camera` | video frames |
 | `/action5/temperature` | `sensor_msgs/Temperature` | `action5_depth` | temperature (°C), with `--temp-field` |
+| `/action5/pressure`, `/action5/depth` | `sensor_msgs/FluidPressure`, `geometry_msgs/PointStamped` | `action5_depth` | camera barometer, with `--depth-field` (meaningless in a sealed housing) |
 
-Covariances are set to 0, which means "unknown" (REP 145). When a measurement is missing, the first element of its covariance is set to -1.
-
-### Options
+Covariances are set to 0 ("unknown", REP 145). When a measurement is missing, the first element of its covariance is set to -1.
 
 | Option | Default | Description |
 |---|---|---|
@@ -226,50 +184,121 @@ Covariances are set to 0, which means "unknown" (REP 145). When a measurement is
 | `--every N` | `1` | keep one frame out of N |
 | `--jpeg-quality` | `90` | JPEG quality |
 | `--t0` | MP4 creation time | absolute time (epoch, s) of the first video frame |
-| `--imu-rate` | `200` | rate (Hz) of the rebuilt IMU (see below) |
-| `--accel-field` | `auto` | `djmd` sub-message of the per-frame accelerometer (`3/2/10` on the Action 4 / 5 Pro); `none` to disable |
-| `--depth-field` | none | `djmd` field holding pressure or depth, e.g. `3/2/13:3` |
-| `--depth-unit` | `m` | unit of `--depth-field`: `m`, `cm`, `mm`, `pa`, `hpa`, `mbar`, `kpa`, `bar` |
-| `--p-atm` | `101325` | atmospheric pressure (Pa) for the pressure ↔ depth conversion; `auto` = minimum pressure of the clip |
+| `--imu-rate` | `200` | rate (Hz) of the rebuilt IMU |
+| `--accel-field` | `auto` | `djmd` sub-message of the per-frame accelerometer (`3/2/10`); `none` to disable |
+| `--temp-field`, `--temp-scale` | none, `0.01` | `djmd` temperature field and factor to °C |
+| `--depth-field`, `--depth-unit` | none, `m` | `djmd` pressure or depth field and its unit |
+| `--p-atm` | `101325` | atmospheric pressure (Pa); `auto` = minimum pressure of the clip |
 | `--water-density` | `1025` | kg/m³ (1025 sea water, 1000 fresh water) |
-| `--temp-field` | none | `djmd` field holding the temperature, e.g. `3/2/13:2` |
-| `--temp-scale` | `0.01` | factor converting `--temp-field` to °C |
-| `--time-unit {auto,ms,s}` | `auto` | time unit of the raw series and quaternions |
-| `--gyro-unit {auto,deg,rad}` | `auto` | unit of the raw gyroscope |
-| `--no-derived-gyro` | off | don't compute the angular velocity from the quaternions when no gyro is available |
+| `--time-unit`, `--gyro-unit` | `auto` | units of the raw series, when telemetry-parser provides them |
 
-### Where the IMU data come from
-
-The script prints what it found in the clip, then uses the first source available:
-
-1. the normalized IMU from telemetry-parser (Gyroflow camera frame);
-2. the raw gyroscope and accelerometer series (sensor frame);
-3. **the attitude quaternions (the Action 5 Pro case): the IMU is rebuilt.**
-   - the quaternions (~1 kHz) are resampled on a `--imu-rate` grid (200 Hz by default);
-   - the angular velocity is computed from them by finite differences;
-   - the per-frame accelerometer (`3/2/10`, ~30 Hz, in g) is converted to m/s² and linearly interpolated on the same grid.
-
-The line `IMU: source = …` in the output tells you which source was used.
-
-The rebuilt IMU is a **pseudo-IMU**: the gyroscope comes from an attitude already filtered by DJI, and the accelerometer loses any content above ~15 Hz. It is fine for gravity direction and slow diver motions, but it doesn't follow the noise model of a raw IMU.
-
-### Timestamps
-
-`stamp = t0 + time since the start of the video`. Frame times are `index / fps`, which holds because the camera records at a constant frame rate. The IMU samples are already aligned with the video by the camera, so no extra synchronization is needed.
+**Rebuilt IMU (Action 5 Pro).** The attitude quaternions (~1 kHz) are resampled at `--imu-rate`. The angular velocity is computed from them by finite differences, and the per-frame accelerometer (~30 Hz, in g) is converted to m/s² and interpolated on the same grid. This is a **pseudo-IMU**: the gyroscope comes from an attitude already filtered by DJI, and the accelerometer loses any content above ~15 Hz. The line `IMU: source = …` in the output tells which source was used.
 
 ---
 
-## 4. View a bag: `view_rosbag.py`
-
-The script plays the bag back. It shows the images of `/action5/image` with the attitude from `/action5/imu` overlaid: roll, pitch, yaw, an artificial horizon, gyroscope and accelerometer values, and the depth when `/action5/depth` is present. It reads ROS 1 and ROS 2 bags, and doesn't need ROS either.
-
-### Usage
+## 3. Analyse the Deep Trekker log: `rov_analysis.py`
 
 ```bash
-python view_rosbag.py bags/DJI_xxxx                # ROS 2 bag (folder)
-python view_rosbag.py bags/DJI_xxxx.bag            # ROS 1 bag
-python view_rosbag.py bags/DJI_xxxx --plot         # + attitude / gyro / accel plots (matplotlib)
-python view_rosbag.py bags/DJI_xxxx --save annotated.mp4 --no-show   # annotated video, no window
+python rov_analysis.py rov_xxxx.csv -o reports/rov_xxxx
+```
+
+The script reads the CSV and finds the columns by the end of their name, i.e. the JSON path of the ROV state (`depth`, `heading`, `velocity.forward`, `position.local.x`, `waterTemp`, …). It prints the mapping it used; force a column with `--map KEY=COLUMN`.
+
+It reports:
+
+- **Sampling**: number of rows, start / end (UTC), period, gaps.
+- **Dives**: in-water segments (`inWater`, or depth > 0.3 m), duration, maximum depth.
+- **Statistics** of every navigation variable, and the **validity** of the DVL altitude and velocity, and the USBL uncertainty.
+- **Sync manoeuvres**: yaw turns faster than `--yaw-rate` (15 deg/s by default), usable by section 4.
+
+Outputs:
+
+| File | Content |
+|---|---|
+| `summary.json` | everything above |
+| `overview.png` | depth / altitude, pitch / roll / camera tilt, heading, DVL velocity, water temperature / batteries; dives shaded, fast yaw turns in red |
+| `track.png` | USBL local position, and DVL dead reckoning (body velocity integrated with the heading) |
+
+Conventions assumed for the Deep Trekker state: heading in degrees clockwise from north; pitch / roll in degrees; DVL velocity in m/s in the body frame (forward, rightward, downward); depth and altitude in m.
+
+---
+
+## 4. Synchronize: `sync_rov_camera.py`
+
+```bash
+python sync_rov_camera.py rov_xxxx.csv bags/DJI_xxxx -o sync/DJI_xxxx
+```
+
+The camera is rigidly mounted on the ROV, so both see the same rotations. The angular speed |ω| does not depend on how the camera is mounted, so the clock offset is found by cross-correlating |ω| from the ROV attitude (heading / pitch / roll) with |ω| from the camera attitude. The search covers the whole ROV log, so any clock gap is found, including a time-zone error in the MP4.
+
+The script then:
+
+- measures the offset on successive windows to estimate the **clock drift** of the camera;
+- estimates the **mounting rotation** ROV → camera IMU by aligning the relative rotations (hand-eye), which also settles the direction of the DJI quaternion.
+
+Outputs:
+
+| File | Content |
+|---|---|
+| `sync.json` | offset (`t_rov = t_cam + offset`), offset at the start of the clip, correlation quality, drift, mounting rotation; read by `merge_bag.py` |
+| `sync.png` | |ω| of both after alignment, and the correlation curve (one sharp peak = reliable) |
+
+The quality is `good` when the correlation peak is high and well above the next one. `UNCERTAIN` means the motion was not distinctive enough: look at `sync.png`, and do the sync manoeuvre on the next dives (section 1). The precision is limited by the ROV log rate (about 0.1 s at 2 Hz).
+
+| Option | Default | Description |
+|---|---|---|
+| `--map KEY=COLUMN` | auto | force a ROV column (`t`, `heading`, `pitch`, `roll`) |
+| `--rate` | `10` | analysis rate (Hz) |
+| `--smooth` | `0.3` | |ω| smoothing window (s) |
+| `--window` | `60` | window for the drift estimate (s) |
+| `--delta` | `1.0` | interval of the relative rotations for the mounting rotation (s) |
+
+---
+
+## 5. Merge into one bag: `merge_bag.py`
+
+```bash
+python merge_bag.py bags/DJI_xxxx rov_xxxx.csv --sync sync/DJI_xxxx/sync.json -o merged/DJI_xxxx           # ROS 2 (mcap)
+python merge_bag.py bags/DJI_xxxx rov_xxxx.csv --sync sync/DJI_xxxx/sync.json -o merged/DJI_xxxx.bag --ros 1
+```
+
+All the camera topics are copied with their stamps moved to the ROV clock: `t_rov = t_cam + offset_at_clip_start + drift × (t_cam − t0_cam)`. The ROV data are added as standard ROS messages:
+
+| Topic | Type | frame_id | Content |
+|---|---|---|---|
+| `/rov/orientation` | `geometry_msgs/QuaternionStamped` | `rov_ned` | body FRD → local NED, from heading / pitch / roll |
+| `/rov/attitude_deg` | `geometry_msgs/Vector3Stamped` | `rov_body_frd` | x = roll, y = pitch, z = heading (deg, as logged) |
+| `/rov/depth` | `geometry_msgs/PointStamped` | `rov_body_frd` | z = depth (m, positive down) |
+| `/rov/altitude` | `geometry_msgs/PointStamped` | `rov_body_frd` | z = DVL altitude above the seabed (m), valid samples only |
+| `/rov/dvl/velocity` | `geometry_msgs/TwistStamped` | `rov_body_frd` | linear x / y / z = forward / rightward / downward (m/s), valid samples only |
+| `/rov/usbl/position` | `geometry_msgs/PointStamped` | `rov_usbl_local` | x, y = USBL local position (as logged) |
+| `/rov/water_temperature` | `sensor_msgs/Temperature` | `rov_body_frd` | water temperature (°C) |
+| `/rov/raw/<column>` | `std_msgs/Float64` | | every other numeric CSV column (USBL uncertainty, batteries, motors, …), written when it changes; booleans as 0 / 1 |
+
+| Option | Default | Description |
+|---|---|---|
+| `--ros {1,2}` | `2` | ROS version of the bag |
+| `--storage {mcap,sqlite3}` | `mcap` | ROS 2 storage plugin |
+| `--margin` | `10` | ROV data kept before / after the camera clip (s) |
+| `--all-rov` | off | keep the whole ROV log |
+| `--no-drift` | off | ignore the clock drift found by the sync |
+| `--no-raw` | off | don't write the `/rov/raw/*` topics |
+| `--map KEY=COLUMN` | auto | force a ROV column (see section 3) |
+| `--overwrite` | off | overwrite the output bag if it exists |
+
+---
+
+## 6. Check and inspect
+
+### View a bag: `view_rosbag.py`
+
+Plays a camera bag or a merged bag back, with the camera attitude overlaid (roll, pitch, yaw, artificial horizon, gyroscope, accelerometer) and the depth (`/rov/depth` in a merged bag, otherwise `/action5/depth`).
+
+```bash
+python view_rosbag.py merged/DJI_xxxx                 # ROS 2 bag (folder)
+python view_rosbag.py merged/DJI_xxxx.bag             # ROS 1 bag
+python view_rosbag.py merged/DJI_xxxx --plot          # + attitude / gyro / accel plots
+python view_rosbag.py merged/DJI_xxxx --save annotated.mp4 --no-show
 ```
 
 | Option | Default | Description |
@@ -279,40 +308,32 @@ python view_rosbag.py bags/DJI_xxxx --save annotated.mp4 --no-show   # annotated
 | `--start` | `0` | start time (s from the beginning of the bag) |
 | `--plot` | off | plot the attitude, gyroscope and accelerometer over time |
 | `--save` | none | write the annotated video to a file |
-| `--no-show` | off | no window (use with `--save`, e.g. on a server) |
+| `--no-show` | off | no window (use with `--save`) |
 
 Keys: `space` pause, `n` next frame (when paused), `+` / `-` speed, `h` horizon on/off, `q` or `Esc` quit.
 
----
+### Inspect the raw camera metadata: `djmd_inspect.py`
 
-## 5. Inspect the raw metadata: `djmd_inspect.py`
-
-The script reads the `djmd` track directly, without telemetry-parser and without a protobuf schema (Python standard library only). Use it to check what a clip contains, to find a field on another camera or firmware, or to export fields that telemetry-parser doesn't decode.
+Reads the `djmd` track directly, without telemetry-parser and without a protobuf schema. Use it to check a clip, find a field on another camera or firmware, or export fields that telemetry-parser doesn't decode.
 
 ```bash
-# structure: every sub-message, its number of occurrences per frame, example values,
-# and candidate quaternions / 3D vectors (accelerometer in g or m/s²)
-python djmd_inspect.py DJI_xxxx.MP4
-
-# export a sub-message to CSV (one row per occurrence, one column per field)
-python djmd_inspect.py DJI_xxxx.MP4 --export 3/2/10 -o accel.csv
-
-# go through the whole clip and list the scalars that vary, with depth / pressure candidates
-python djmd_inspect.py DJI_xxxx.MP4 --scan --scan-csv scalars.csv
+python djmd_inspect.py DJI_xxxx.MP4                                  # structure, quaternion / vector candidates
+python djmd_inspect.py DJI_xxxx.MP4 --export 3/2/10 -o accel.csv     # export a sub-message
+python djmd_inspect.py DJI_xxxx.MP4 --scan --scan-csv scalars.csv    # varying scalars, depth / pressure candidates
 ```
 
-Paths such as `3/2/10` are nested protobuf field numbers; a scalar field is written `PATH:FIELD` (e.g. `3/2/13:3`). These are the values expected by the `--accel-field`, `--depth-field` and `--temp-field` options of `mp4_to_rosbag.py`.
+Paths such as `3/2/10` are nested protobuf field numbers; a scalar field is written `PATH:FIELD` (e.g. `3/2/13:3`), as expected by the `--accel-field`, `--depth-field` and `--temp-field` options.
 
 ---
 
 ## Known limitations
 
-- **t0 time zone**: the MP4 creation time is read as UTC, but DJI sometimes writes local time. Check it, and override it with `--t0` if needed.
-- **Quaternion frame**: DJI doesn't document the frame or the direction of the quaternion (body→world or world→body). Validate it with a known rotation, e.g. 90° around one axis.
-- **Heading**: it's not clear whether the camera uses a magnetometer in the fusion, so the yaw is probably relative and drifts.
-- **Rebuilt IMU** (Action 5 Pro): the gyroscope is derived from a filtered attitude, and the accelerometer is sampled once per frame (~30 Hz); its exact sampling instant within the frame is unknown (±16 ms).
-- **Barometer**: inside a sealed housing it measures the housing air, not the depth. The temperature field (`3/2/13:2`) is an assumption: check that it gives plausible values.
-- **Raw units**: the time unit of the raw series (ms or s) and the gyroscope unit are guessed automatically. Check them on your first clip and force them with `--time-unit` and `--gyro-unit` if needed.
+- **Synchronization** relies on rotations: a dive without distinctive turns gives an uncertain offset. Its precision is limited by the ROV log rate.
+- **Camera t0**: before synchronization, the MP4 creation time is read as UTC, but DJI sometimes writes local time; the synchronization corrects it.
+- **Quaternion frame**: DJI doesn't document it; the synchronization estimates its direction and the mounting rotation, which should be checked against the physical mounting.
+- **Rebuilt IMU**: the gyroscope is derived from a filtered attitude, and the accelerometer is sampled once per frame (~30 Hz) at an unknown instant within the frame (±16 ms).
+- **ROV conventions**: heading, DVL axes and USBL local axes are taken as logged by the Deep Trekker; check them against a known manoeuvre.
+- **Camera barometer**: inside a sealed housing it measures the housing air. The temperature field (`3/2/13:2`) is an assumption.
 
 ## Acknowledgements
 

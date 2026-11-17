@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
-Extraction IMU (brute + normalisée) et attitude (quaternions) d'un MP4
-DJI Osmo Action 5 Pro, via telemetry-parser (la librairie de Gyroflow).
+Extract the IMU (raw + normalized) and the attitude (quaternions) from a
+DJI Osmo Action 5 Pro MP4, using telemetry-parser (the Gyroflow library).
 
     pip install telemetry-parser
-    python dji_imu_extract.py DJI_20261116_0001.MP4 [-o sorties/] [--dump-json]
+    python dji_imu_extract.py DJI_20261116_0001.MP4 [-o output/] [--dump-json]
 
-Rappel : la caméra n'enregistre ces données que si la stabilisation (EIS /
-RockSteady) est désactivée et le FOV en Wide.
+Reminder: the camera only records these data with stabilization (EIS /
+RockSteady) off and the FOV set to Wide.
 
-Sorties (dans -o, par défaut à côté du MP4) :
-  <nom>_gyro_raw.csv, <nom>_accl_raw.csv   données capteur telles que décodées
-  <nom>_imu_norm.csv                       IMU remise dans le repère caméra
-                                           Gyroflow (gyro en deg/s)
-  <nom>_attitude.csv                       quaternions (w,x,y,z) + Euler ZYX en degrés
-  <nom>_telemetry.json                     (option --dump-json) tout le contenu
-                                           décodé, pour inspection
+Outputs (in -o, next to the MP4 by default):
+  <name>_gyro_raw.csv, <name>_accl_raw.csv   sensor data as decoded
+  <name>_imu_norm.csv                        IMU in the Gyroflow camera frame (gyro in deg/s)
+  <name>_attitude.csv                        quaternions (w,x,y,z) + ZYX Euler angles in degrees
+  <name>_telemetry.json                      (--dump-json) all the decoded content, for inspection
+
+On the Action 5 Pro, telemetry-parser only returns the attitude quaternions;
+the per-frame accelerometer is read by djmd_inspect.py / mp4_to_rosbag.py.
 """
 import argparse
 import csv
@@ -27,11 +28,11 @@ from pathlib import Path
 try:
     import telemetry_parser
 except ImportError:
-    sys.exit("telemetry-parser manquant : pip install telemetry-parser")
+    sys.exit("telemetry-parser missing: pip install telemetry-parser")
 
 
 def walk(obj, path=()):
-    """Parcourt une structure imbriquée et renvoie (chemin, dict) pour chaque dict."""
+    """Walks a nested structure and yields (path, dict) for every dict."""
     if isinstance(obj, dict):
         yield path, obj
         for k, v in obj.items():
@@ -46,10 +47,10 @@ def is_num(v):
 
 
 def collect(telemetry):
-    """Repère, dans la sortie de tp.telemetry(), les séries gyro / accéléro /
-    magnéto (dicts {t,x,y,z}) et les quaternions ({t, v:{w,x,y,z}} ou {t,w,x,y,z}).
-    Recherche par forme plutôt que par clé exacte, pour résister aux variations
-    de version de telemetry-parser et de modèle de caméra."""
+    """Finds, in the output of tp.telemetry(), the gyroscope / accelerometer /
+    magnetometer series ({t,x,y,z} dicts) and the quaternions ({t, v:{w,x,y,z}}
+    or {t,w,x,y,z}). Matches on shape rather than exact keys, to cope with
+    telemetry-parser versions and camera models."""
     series = {"Gyroscope": [], "Accelerometer": [], "Magnetometer": []}
     quats = []
     for path, d in walk(telemetry):
@@ -66,7 +67,7 @@ def collect(telemetry):
         elif {"t", "w", "x", "y", "z"} <= keys and all(is_num(d[k]) for k in "twxyz"):
             quats.append((d["t"], d["w"], d["x"], d["y"], d["z"]))
 
-    def clean(rows):  # tri + suppression des doublons de timestamp
+    def clean(rows):  # sort + drop duplicated timestamps
         out, seen = [], set()
         for r in sorted(rows, key=lambda r: r[0]):
             if r[0] not in seen:
@@ -78,9 +79,9 @@ def collect(telemetry):
 
 
 def quat_to_euler_zyx(w, x, y, z):
-    """Quaternion de Hamilton -> (roll, pitch, yaw) en degrés, convention ZYX.
-    Le repère et le sens de la rotation (corps->monde ou l'inverse) ne sont pas
-    documentés par DJI : à valider sur un mouvement connu."""
+    """Hamilton quaternion -> (roll, pitch, yaw) in degrees, ZYX convention.
+    DJI does not document the frame or the direction of the rotation
+    (body->world or the opposite): validate on a known motion."""
     n = math.sqrt(w * w + x * x + y * y + z * z) or 1.0
     w, x, y, z = w / n, x / n, y / n, z / n
     roll = math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
@@ -94,14 +95,14 @@ def write_csv(path, header, rows):
         w = csv.writer(f)
         w.writerow(header)
         w.writerows(rows)
-    print(f"  {path.name}: {len(rows)} lignes")
+    print(f"  {path.name}: {len(rows)} rows")
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("mp4")
     ap.add_argument("-o", "--outdir", default=None)
-    ap.add_argument("--dump-json", action="store_true", help="écrit toute la télémétrie décodée en JSON")
+    ap.add_argument("--dump-json", action="store_true", help="write all the decoded telemetry to JSON")
     a = ap.parse_args()
 
     src = Path(a.mp4)
@@ -110,19 +111,18 @@ def main():
     stem = src.stem
 
     tp = telemetry_parser.Parser(str(src))
-    print(f"Caméra : {tp.camera}  Modèle : {tp.model}")
+    print(f"Camera: {tp.camera}  Model: {tp.model}")
 
     telemetry = tp.telemetry()
     if a.dump_json:
         p = out / f"{stem}_telemetry.json"
         p.write_text(json.dumps(telemetry, default=str, indent=1))
-        print(f"  {p.name} écrit")
+        print(f"  {p.name} written")
 
     series, quats = collect(telemetry)
 
-    # 1) Données brutes (unités et repère capteur telles que décodées ; le champ
-    #    t est le timestamp fourni par le fichier, en ms en général : à vérifier
-    #    sur la durée totale du clip)
+    # 1) Raw data (units and sensor frame as decoded; t is the timestamp stored
+    #    in the file, usually in ms: check it against the clip duration)
     if series["Gyroscope"]:
         write_csv(out / f"{stem}_gyro_raw.csv", ["t", "gx", "gy", "gz"], series["Gyroscope"])
     if series["Accelerometer"]:
@@ -130,8 +130,8 @@ def main():
     if series["Magnetometer"]:
         write_csv(out / f"{stem}_magn_raw.csv", ["t", "mx", "my", "mz"], series["Magnetometer"])
 
-    # 2) IMU normalisée par telemetry-parser (repère caméra Gyroflow, gyro en deg/s,
-    #    accéléro : vérifie la norme au repos, ~1 si en g, ~9.81 si en m/s²)
+    # 2) IMU normalized by telemetry-parser (Gyroflow camera frame, gyro in deg/s;
+    #    accelerometer: check the norm at rest, ~1 if in g, ~9.81 if in m/s²)
     norm = tp.normalized_imu() or []
     rows = []
     for s in norm:
@@ -143,18 +143,18 @@ def main():
         write_csv(out / f"{stem}_imu_norm.csv",
                   ["timestamp_ms", "gx_dps", "gy_dps", "gz_dps", "ax", "ay", "az", "mx", "my", "mz"], rows)
 
-    # 3) Attitude : quaternions issus de la fusion faite par la caméra
+    # 3) Attitude: quaternions from the camera's own sensor fusion
     if quats:
         rows = [[t, w, x, y, z, *quat_to_euler_zyx(w, x, y, z)] for t, w, x, y, z in quats]
         write_csv(out / f"{stem}_attitude.csv",
                   ["t", "qw", "qx", "qy", "qz", "roll_deg", "pitch_deg", "yaw_deg"], rows)
     else:
-        print("  Aucun quaternion trouvé : relance avec --dump-json pour inspecter, "
-              "ou utilise djmd_inspect.py.")
+        print("  No quaternion found: run again with --dump-json to inspect, "
+              "or use djmd_inspect.py.")
 
     if not (series["Gyroscope"] or norm or quats):
-        print("Aucune donnée IMU : vérifie que la vidéo a été tournée avec la "
-              "stabilisation désactivée et le FOV en Wide.")
+        print("No IMU data: check that the video was recorded with stabilization off "
+              "and the FOV set to Wide.")
 
 
 if __name__ == "__main__":

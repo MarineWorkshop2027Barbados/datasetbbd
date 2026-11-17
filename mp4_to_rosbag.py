@@ -3,6 +3,15 @@
 Conversion d'un MP4 DJI Osmo Action 5 Pro en rosbag (ROS 1 ou ROS 2) :
   /action5/imu    sensor_msgs/Imu    gyro (rad/s), accéléro (m/s²), attitude (quaternion caméra)
   /action5/image  sensor_msgs/CompressedImage (JPEG, défaut) ou sensor_msgs/Image (--raw)
+  /action5/pressure  sensor_msgs/FluidPressure (Pa)             } avec --depth-field
+  /action5/depth     geometry_msgs/PointStamped, z = profondeur  } (m, positive vers le bas)
+  /action5/temperature  sensor_msgs/Temperature (°C)            avec --temp-field
+
+Action 5 Pro (dvtm_ac204) : la piste djmd ne contient que l'attitude à ~1 kHz
+(3/3/2/3) et un accéléro par image (3/2/10, en g, ~30 Hz). L'IMU écrite est alors
+reconstruite : gyro dérivé de l'attitude, accéléro interpolé, à --imu-rate Hz.
+Baromètre : 3/2/13:3 = pression (hPa), 3/2/13:2 = température (centièmes de °C) ;
+dans un caisson étanche, il mesure l'air du caisson, pas la profondeur.
 
 Pas besoin d'installation ROS :
     pip install rosbags telemetry-parser opencv-python numpy
@@ -12,6 +21,8 @@ Exemples :
     python mp4_to_rosbag.py DJI_xxxx.MP4 -o bag_ros2 --storage mcap     # ROS 2, mcap
     python mp4_to_rosbag.py DJI_xxxx.MP4 -o clip.bag --ros 1            # ROS 1
     python mp4_to_rosbag.py DJI_xxxx.MP4 -o bag --raw --scale 0.5       # images brutes, demi-résolution
+    python mp4_to_rosbag.py DJI_xxxx.MP4 -o bag --depth-field 3/2/13:3 --depth-unit hpa --p-atm auto \
+        --temp-field 3/2/13:2                                          # + pression/profondeur, température
 
 dji_imu_extract.py doit être dans le même dossier (on réutilise sa fonction collect).
 
@@ -23,6 +34,7 @@ pour les caméras DJI.
 """
 import argparse
 import math
+import shutil
 import struct
 import sys
 from bisect import bisect_left
@@ -33,7 +45,7 @@ import numpy as np
 import telemetry_parser
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from dji_imu_extract import collect  # noqa: E402
+from dji_imu_extract import collect, walk  # noqa: E402
 
 G = 9.80665
 
@@ -144,6 +156,32 @@ def gyro_from_quats(qt):
         out.append([dx * s, dy * s, dz * s])
     return out
 
+def djmd_vector(mp4, spec, fields=(2, 3, 4)):
+    """Vecteur 3D par image dans la piste djmd (ex. accéléro 3/2/10, champs 2-4).
+    Renvoie (t en s depuis le début du clip, valeurs (N,3)) ou (None, None)."""
+    from djmd_inspect import read_field
+    path = "3/2/10" if spec == "auto" else spec
+    try:
+        cols = [read_field(mp4, path, f) for f in fields]
+    except ValueError:
+        return None, None
+    if not cols[0][0] or any(len(c[0]) != len(cols[0][0]) for c in cols):
+        if spec != "auto":
+            print(f"  accéléro {path} : champs {fields} absents ou incomplets")
+        return None, None
+    return np.asarray(cols[0][0]), np.stack([np.asarray(c[1]) for c in cols], 1)
+
+
+def djmd_scalar(mp4, spec):
+    """Série d'un champ CHEMIN:CHAMP, sans les valeurs sentinelles (entiers non signés 'négatifs')."""
+    from djmd_inspect import read_field
+    path, _, fld = spec.rpartition(":")
+    t, v = read_field(mp4, path, int(fld))
+    t, v = np.asarray(t, float), np.asarray(v, float)
+    ok = np.abs(v) < 1e12
+    return t[ok], v[ok]
+
+
 # ---------------------------------------------------------------- rosbag
 
 class BagWriter:
@@ -203,6 +241,30 @@ class BagWriter:
         )
         self.write(self.c_imu, msg, t_ns)
 
+    def enable_depth(self):
+        T = self.ts.types
+        self.Press, self.PtS = T["sensor_msgs/msg/FluidPressure"], T["geometry_msgs/msg/PointStamped"]
+        self.Point = T["geometry_msgs/msg/Point"]
+        self.c_press = self.w.add_connection("/action5/pressure", self.Press.__msgtype__, typestore=self.ts)
+        self.c_depth = self.w.add_connection("/action5/depth", self.PtS.__msgtype__, typestore=self.ts)
+        self.seq["press"] = self.seq["depth"] = 0
+
+    def depth(self, t_ns, pressure_pa, depth_m):
+        self.write(self.c_press, self.Press(header=self.header(t_ns, "action5_depth", "press"),
+                                            fluid_pressure=float(pressure_pa), variance=0.0), t_ns)
+        # profondeur en m, positive vers le bas, dans point.z
+        self.write(self.c_depth, self.PtS(header=self.header(t_ns, "action5_depth", "depth"),
+                                          point=self.Point(x=0.0, y=0.0, z=float(depth_m))), t_ns)
+
+    def enable_temperature(self):
+        self.Temp = self.ts.types["sensor_msgs/msg/Temperature"]
+        self.c_temp = self.w.add_connection("/action5/temperature", self.Temp.__msgtype__, typestore=self.ts)
+        self.seq["temp"] = 0
+
+    def temperature(self, t_ns, celsius):
+        self.write(self.c_temp, self.Temp(header=self.header(t_ns, "action5_depth", "temp"),
+                                          temperature=float(celsius), variance=0.0), t_ns)
+
     def image(self, t_ns, frame_bgr, jpeg_q):
         h = self.header(t_ns, "action5_camera", "img")
         if self.Img.__msgtype__.endswith("CompressedImage"):
@@ -234,9 +296,32 @@ def main():
                     help="unité du t des séries brutes et des quaternions")
     ap.add_argument("--gyro-unit", choices=("auto", "deg", "rad"), default="auto",
                     help="unité du gyro brut (si normalized_imu est vide)")
+    ap.add_argument("--overwrite", action="store_true", help="écrase le bag de sortie s'il existe")
+    ap.add_argument("--depth-field", metavar="CHEMIN:CHAMP",
+                    help="champ djmd de la profondeur ou de la pression (trouvé avec djmd_inspect.py --scan), ex. 3/7:2")
+    ap.add_argument("--depth-unit", choices=("m", "cm", "mm", "pa", "hpa", "mbar", "kpa", "bar"), default="m",
+                    help="unité du champ --depth-field")
+    ap.add_argument("--p-atm", default="101325",
+                    help="pression atmosphérique (Pa) pour convertir pression <-> profondeur ; "
+                         "'auto' = pression minimale du clip (clip commencé en surface)")
+    ap.add_argument("--water-density", type=float, default=1025.0, help="kg/m³ (1025 mer, 1000 eau douce)")
+    ap.add_argument("--accel-field", default="auto", metavar="CHEMIN|auto|none",
+                    help="sous-message djmd de l'accéléro par image (Action 4/5 Pro : 3/2/10, champs 2-4, en g) ; "
+                         "'auto' = 3/2/10 s'il existe, utilisé seulement si telemetry-parser ne fournit pas d'accéléro")
+    ap.add_argument("--imu-rate", type=float, default=200.0,
+                    help="cadence (Hz) de l'IMU reconstruite quand le gyro est dérivé des quaternions")
+    ap.add_argument("--temp-field", metavar="CHEMIN:CHAMP",
+                    help="champ djmd de la température (Action 5 Pro : 3/2/13:2, en centièmes de °C)")
+    ap.add_argument("--temp-scale", type=float, default=0.01, help="facteur vers des °C (défaut 0.01)")
     ap.add_argument("--no-derived-gyro", action="store_true",
                     help="ne pas dériver la vitesse angulaire des quaternions s'il n'y a pas de gyro")
     a = ap.parse_args()
+
+    out = Path(a.out)
+    if out.exists():
+        if not a.overwrite:
+            sys.exit(f"{out} existe déjà : supprime-le ou relance avec --overwrite")
+        shutil.rmtree(out) if out.is_dir() else out.unlink()
 
     cap = cv2.VideoCapture(a.mp4)
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -293,8 +378,23 @@ def main():
             used.add(key)
         samples += [(t, None, [x, y, z]) for t, x, y, z in acc if round(t, 6) not in used]
     elif quats and not a.no_derived_gyro:
-        source = "quaternions seuls -> gyro dérivé, pas d'accéléro"
-        samples = [(q[0], w, None) for q, w in zip(quats, gyro_from_quats(quats))]
+        # IMU reconstruite : quaternions rééchantillonnés à --imu-rate, gyro par
+        # différences finies (moyenne naturelle sur 1/imu-rate), accéléro par image
+        # interpolé linéairement. Le contenu au-delà de ~15 Hz est perdu sur l'accéléro.
+        t_lo, t_hi = quats[0][0], quats[-1][0]
+        grid = np.arange(t_lo, t_hi, 1.0 / a.imu_rate)
+        qg = [(t, *qi(t)) for t in grid]
+        gyro = gyro_from_quats(qg)
+        acc_t, acc_v = djmd_vector(a.mp4, a.accel_field) if a.accel_field != "none" else (None, None)
+        if acc_t is not None:
+            acc_i = np.stack([np.interp(grid, acc_t, acc_v[:, k], left=np.nan, right=np.nan) for k in range(3)], 1)
+            samples = [(t, g, None if np.isnan(av).any() else list(av)) for t, g, av in zip(grid, gyro, acc_i)]
+            source = (f"quaternions -> gyro dérivé + accéléro djmd {a.accel_field if a.accel_field != 'auto' else '3/2/10'} "
+                      f"({len(acc_t)} mesures, ~{len(acc_t) / max(acc_t[-1] - acc_t[0], 1e-9):.0f} Hz), "
+                      f"rééchantillonnés à {a.imu_rate:g} Hz")
+        else:
+            samples = [(t, g, None) for t, g in zip(grid, gyro)]
+            source = f"quaternions seuls -> gyro dérivé à {a.imu_rate:g} Hz, pas d'accéléro"
     elif quats:
         source = "quaternions seuls"
         samples = [(q[0], None, None) for q in quats]
@@ -318,7 +418,49 @@ def main():
     t0_ns = int(round(t0 * 1e9))
     print(f"t0 = {t0:.3f} s epoch")
 
+    # --- profondeur / pression
+    depth_rows = []
+    if a.depth_field:
+        ts_d, vs = djmd_scalar(a.mp4, a.depth_field)
+        if not len(vs):
+            sys.exit(f"Champ {a.depth_field} introuvable dans la piste djmd")
+        rho_g = a.water_density * G
+        to_pa = {"pa": 1.0, "hpa": 100.0, "mbar": 100.0, "kpa": 1000.0, "bar": 1e5}
+        to_m = {"m": 1.0, "cm": 0.01, "mm": 0.001}
+        if a.depth_unit in to_pa:
+            p_pa = vs * to_pa[a.depth_unit]
+            p_atm = float(p_pa.min()) if a.p_atm == "auto" else float(a.p_atm)
+            d_m = (p_pa - p_atm) / rho_g
+        else:
+            d_m = vs * to_m[a.depth_unit]
+            p_atm = float(a.p_atm) if a.p_atm != "auto" else 101325.0
+            p_pa = p_atm + d_m * rho_g
+        depth_rows = list(zip(ts_d, p_pa, d_m))
+        print(f"Profondeur : {len(depth_rows)} mesures, de {d_m.min():.2f} à {d_m.max():.2f} m "
+              f"(P_atm = {p_atm:.0f} Pa, ρ = {a.water_density:g} kg/m³)")
+    else:
+        hits = sorted({" / ".join(pth) for pth, _ in walk(tp.telemetry())
+                       if any(w in " ".join(pth).lower() for w in ("depth", "pressure", "baro"))})
+        if hits:
+            print("Champs de profondeur/pression vus par telemetry-parser (non utilisés) : " + "; ".join(hits[:5]))
+
+    temp_rows = []
+    if a.temp_field:
+        tt, tv = djmd_scalar(a.mp4, a.temp_field)
+        temp_rows = list(zip(tt, tv * a.temp_scale))
+        if temp_rows:
+            print(f"Température : {len(temp_rows)} mesures, {min(r[1] for r in temp_rows):.2f} "
+                  f"à {max(r[1] for r in temp_rows):.2f} °C")
+
     bag = BagWriter(a.out, a.ros, a.storage, a.raw)
+    if temp_rows:
+        bag.enable_temperature()
+        for t, c in temp_rows:
+            bag.temperature(t0_ns + int(round(t * 1e9)), c)
+    if depth_rows:
+        bag.enable_depth()
+        for t, p_pa, d_m in depth_rows:
+            bag.depth(t0_ns + int(round(t * 1e9)), p_pa, d_m)
 
     j = n_img = 0
     i = 0
